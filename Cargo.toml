@@ -1,6 +1,7 @@
 [package]
 name = "hello_world"
 version = "0.1.0"
+authors = ["Tehrence Jackson <tjacks46@students.towson.edu>"]
 edition = "2024"
 
 [dependencies]
