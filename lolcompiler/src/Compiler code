@@ -1,0 +1,795 @@
+use std::env;
+use std::fs;
+use std::collections::HashMap;
+use std::process::{self, Command};
+
+pub enum Token {
+    //Tokens starting with the #
+    Hai, Kthxbye, Obtw, Tldr, Maek, Oic, Gimmeh, Mkay, 
+    
+    //Second halves of particular two word tokens
+    Head, Title, Paragraf, Bold, Italics, List, Item, Newline, 
+    Soundz, Vidz, 
+    
+    //For specific two word key tokens
+    IHaz, ItIz, LemmeSee,
+    
+    //Special ones
+    VarDef(String), Text(String), Address(String), EoF,
+}
+
+pub trait Compiler {
+    /// Begin the compilation process (entry point).
+    fn compile(&mut self, source: &str);
+
+    /// Get the next token from the lexical analyzer.
+    fn next_token(&mut self) -> String;
+
+    /// Run the syntax analyzer starting from <lolcode>.
+    fn parse(&mut self);
+
+    /// Get the current token being processed.
+    fn current_token(&self) -> String;
+
+    /// Set the current token (typically used internally).
+    fn set_current_token(&mut self, tok: String);
+}
+
+pub trait LexicalAnalyzer {
+    /// Return the next character from the input.
+    /// If input is exhausted, should terminate the program.
+    fn get_char(&mut self) -> char;
+
+    /// Add a character to the current potential token.
+    fn add_char(&mut self, c: char);
+
+    /// Lookup a potential token to determine if it is valid.
+    /// Returns true if a valid token/lexeme, false otherwise.
+    fn lookup(&self, s: &str) -> bool;
+}
+
+pub trait SyntaxAnalyzer {
+    fn parse_lolcode(&mut self);        
+    fn parse_head(&mut self);           
+    fn parse_title(&mut self);         
+    fn parse_comment(&mut self);        
+    fn parse_body(&mut self);           
+    fn parse_paragraph(&mut self);      
+    fn parse_inner_paragraph(&mut self);
+    fn parse_inner_text(&mut self);     
+    fn parse_variable_define(&mut self);
+    fn parse_variable_use(&mut self);   
+    fn parse_bold(&mut self);           
+    fn parse_italics(&mut self);        
+    fn parse_list(&mut self);           
+    fn parse_list_items(&mut self);     
+    fn parse_inner_list(&mut self);     
+    fn parse_audio(&mut self);          
+    fn parse_video(&mut self);          
+    fn parse_newline(&mut self);        
+    fn parse_text(&mut self);           
+}
+
+//matches current string token as a top level keyword
+fn is_top_kw(u: &str) -> bool {
+    matches!(u,
+        "#HAI" | "#KTHXBYE" | "#OBTW" | "#TLDR" |
+        "#MAEK" | "#GIMMEH" | "#OIC" | "#MKAY" |
+        "#I HAZ" | "#IT IZ" | "#LEMME SEE"
+    )
+}
+
+//matches current string token as a bare (or second word of phrase) level keyword
+fn is_bare_kw(u: &str) -> bool {
+    matches!(u,
+        "HEAD" | "TITLE" | "PARAGRAF" | "BOLD" | "ITALICS" |
+        "LIST" | "ITEM" | "NEWLINE" | "SOUNDZ" | "VIDZ"
+    )
+}
+
+pub struct LolLexer {
+    input: Vec<char>,
+    pos: usize,
+    line: usize,
+    col: usize,
+    current_lexeme: String,
+}
+
+impl LolLexer {
+    fn new(source: &str) -> Self {
+        Self {
+            input: source.chars().collect(),
+            pos: 0,
+            line: 1,
+            col: 1,
+            current_lexeme: String::new(),
+        }
+    }
+
+    //character by character recursion method that'll return a string value as a valid token
+    //or it'll return an error if something unexpected happens
+    fn get_next_token(&mut self) -> String {
+        while self.pos < self.input.len() {
+            let c = self.input[self.pos];
+            //if we get a special case like spaces or newlines
+            //we just essentially skip past them and move on until we get something needed
+            if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+                self.get_char();
+            } else {
+                break;
+            }
+        }
+
+
+        //just returns the end of file, once we reach the end
+        if self.pos >= self.input.len() {
+            return "EOF".to_string();
+        }
+
+        //checks if the first lettr of the string we find is #
+        if self.input[self.pos] == '#' {
+            self.get_char();
+            let mut word = String::from("#"); //starts the lexeme with thr #
+            
+            while self.pos < self.input.len() {
+                let c = self.input[self.pos];
+                if c.is_ascii_alphabetic() || c == ' ' {
+                    self.add_char(c);
+                    word.push(c);
+                    self.get_char();
+                } else {
+                    break;
+                }
+            }
+            
+            //for case-insensitve tokens, we want to have an upper version of the string word, just in case
+            let upper = collapse_spaces_to_upper(&word);
+            
+            //if we don't have a keyword then we have a lexical error
+            if !is_top_kw(&upper) {
+                eprintln!("Lexical error: unknown annotation '{}'", word);
+                process::exit(1);
+            }
+            return upper;
+        }
+
+        //start reading readings for regular text
+        //could be words, address links, or variable names
+        let mut word = String::new();
+        while self.pos < self.input.len() {
+            let c = self.input[self.pos];
+
+            //stops if we encounter a space or # in text
+            if c.is_whitespace() || c == '#' {
+                break;
+            }
+            
+            self.add_char(c);
+            word.push(c);
+            self.get_char();
+        }
+
+        //if a word or address is empty, where it is needed, then we have another lexical error.
+        if word.is_empty() {
+            eprintln!("Lexical error. Expecting text.");
+            process::exit(1);
+        }
+
+        let upper = word.to_ascii_uppercase();
+        if is_bare_kw(&upper) {
+            return upper;
+        }
+
+        word
+    }
+}
+
+fn collapse_spaces_to_upper(s: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in s.chars() {
+        let u = ch.to_ascii_uppercase();
+        if u == ' ' {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(u);
+            last_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+impl LexicalAnalyzer for LolLexer {
+    fn get_char(&mut self) -> char {
+        if self.pos >= self.input.len() {
+            
+            //just in case it tries to ask for a character or go past the end of the file
+            eprintln!("Fatal: get_char at EOF");
+            process::exit(0);
+        }
+        let c = self.input[self.pos];
+        self.pos += 1;
+        if c == '\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        c
+    }
+
+    fn add_char(&mut self, c: char) {
+        self.current_lexeme.push(c);
+    }
+
+    fn lookup(&self, s: &str) -> bool {
+        //searches our enums to see if our word matches any of the keyword tokens we declared before
+        let u = s.to_ascii_uppercase();
+        is_top_kw(&u) || is_bare_kw(&u)
+    }
+}
+
+struct LolCompiler {
+    lexer: LolLexer,
+    current: String,
+    out_html: String,
+    vars: HashMap<String, String>,
+}
+
+impl LolCompiler {
+    fn new(source: &str) -> Self {
+        Self {
+            lexer: LolLexer::new(source),
+            current: String::new(),
+            out_html: String::new(),
+            vars: HashMap::new(),
+        }
+    }
+}
+
+impl Compiler for LolCompiler {
+    fn compile(&mut self, source: &str) {
+        
+        self.lexer = LolLexer::new(source);
+        self.out_html.clear();
+        self.parse();
+        
+        //setting up path to open in chrome
+        let path = "out.html";
+        if fs::write(path, &self.out_html).is_err() {
+            eprintln!("Could not write {}", path);
+            process::exit(1);
+        }
+        
+
+        //For trying to open up chrome
+        let opened = Command::new("cmd")
+            .args(&["/C", "start", "chrome", path])
+            .spawn()
+            .is_ok();
+
+        if !opened {
+            eprintln!("Could not open Chrome automatically. Open '{}' manually.", path);
+        }
+    }
+
+    fn next_token(&mut self) -> String {
+        let t = self.lexer.get_next_token();
+        self.set_current_token(t.clone());
+        
+        t
+    }
+
+    fn parse(&mut self) {
+        self.parse_lolcode(); //starting the syntax analyzer portion of the code
+    }
+
+    fn current_token(&self) -> String {
+        self.current.clone()
+    }
+
+    fn set_current_token(&mut self, tok: String) {
+        self.current = tok;
+    }
+}
+
+
+//we're building the syntax here, where we're just gonna
+//simply follow the grammar rules of the BNF as best we can
+//after that, we map the lolcode to a more proper html translation
+impl SyntaxAnalyzer for LolCompiler {
+    fn parse_lolcode(&mut self) {
+        let t0 = self.next_token();
+        if t0 != "#HAI" { std::process::exit(1); }
+        self.out_html.push_str("<html>\n");
+        loop {
+            let t = self.next_token();
+            if t == "#KTHXBYE" { 
+                break; 
+            }
+            if t == "EOF" { 
+                std::process::exit(1); 
+            }
+            if t == "#MAEK" {
+                let k = self.next_token();
+                if k == "HEAD" { 
+                    self.parse_head(); 
+                    continue; 
+                }
+                if k == "PARAGRAF" { 
+                    self.parse_paragraph(); 
+                    continue; 
+                }
+                if k == "LIST" { 
+                    self.parse_list(); 
+                    continue; 
+                }
+                std::process::exit(1);
+            }
+            if t == "#GIMMEH" {
+                let k = self.next_token();
+                if k == "TITLE" { 
+                    self.parse_title(); 
+                    continue; 
+                }
+                if k == "BOLD" { 
+                    self.parse_bold(); 
+                    continue; 
+                }
+                if k == "ITALICS" { 
+                    self.parse_italics(); 
+                    continue; 
+                }
+                if k == "ITEM" { 
+                    self.parse_list(); 
+                    continue;
+                }
+                if k == "NEWLINE" { 
+                    self.parse_newline(); 
+                    continue; 
+                }
+                if k == "SOUNDZ" { 
+                    self.parse_audio(); 
+                    continue; 
+                }
+                if k == "VIDZ" { 
+                    self.parse_video(); 
+                    continue; 
+                }
+                std::process::exit(1);
+            }
+            if t == "#I HAZ" { 
+                self.parse_variable_define(); 
+                continue; 
+            }
+            if t == "#LEMME SEE" { 
+                self.parse_variable_use(); 
+                continue; 
+            }
+            if t == "#OIC" { 
+                continue; 
+            }
+        }
+        self.out_html.push_str("</html>\n");
+    }
+
+    fn parse_head(&mut self) {
+        self.out_html.push_str("<head>");
+        loop {
+            let t = self.next_token();
+            if t == "#OIC" { 
+                break; 
+            }
+            if t == "#GIMMEH" {
+                let k = self.next_token();
+                if k == "TITLE" { 
+                    self.parse_title(); 
+                    continue; 
+                }
+                std::process::exit(1);
+            }
+            if t == "EOF" { 
+                std::process::exit(1); 
+            }
+        }
+        self.out_html.push_str("</head>\n");
+    }
+
+    fn parse_title(&mut self) {
+        self.out_html.push_str("<title>");
+        loop {
+            let t = self.next_token();
+            if t == "#MKAY" { 
+                break; 
+            }
+            if t == "#LEMME SEE" { 
+                self.parse_variable_use(); 
+                continue; 
+            }
+            if t == "EOF" || t.starts_with('#') { 
+                std::process::exit(1); 
+            }
+            self.out_html.push_str(&t);
+            self.out_html.push(' ');
+        }
+        self.out_html.push_str("</title>");
+    }
+
+    fn parse_comment(&mut self) {
+        self.out_html.push_str("<!--");
+        loop {
+            let t = self.next_token();
+            if t == "#TLDR" {
+                break;
+            }
+            if t == "EOF" {
+                std::process::exit(1);
+            }
+            self.out_html.push_str(&t);
+            self.out_html.push(' ');
+        }
+        self.out_html.push_str("-->");
+    }
+
+
+    fn parse_body(&mut self) {
+        loop {
+            let t = self.current_token();
+            if t == "#KTHXBYE" || t == "EOF" { 
+                break; 
+            }
+            let t2 = self.next_token();
+            if t2 == "#MAEK" {
+                let k = self.next_token();
+                if k == "PARAGRAF" { 
+                    self.parse_paragraph(); 
+                    continue; 
+                }
+                if k == "LIST" { 
+                    self.parse_list(); 
+                    continue; 
+                }
+                std::process::exit(1);
+            }
+            if t2 == "#GIMMEH" {
+                let k = self.next_token();
+                if k == "BOLD" { 
+                    self.parse_bold(); 
+                    continue; 
+                }
+                if k == "ITALICS" { 
+                    self.parse_italics(); 
+                    continue; 
+                }
+                if k == "NEWLINE" { 
+                    self.parse_newline(); 
+                    continue; 
+                }
+                if k == "SOUNDZ" { 
+                    self.parse_audio(); 
+                    continue; 
+                }
+                if k == "VIDZ" { 
+                    self.parse_video(); 
+                    continue; 
+                }
+                std::process::exit(1);
+            }
+            if t2 == "#I HAZ" { 
+                self.parse_variable_define(); 
+                continue; 
+            }
+            if t2 == "#LEMME SEE" { 
+                self.parse_variable_use(); 
+                continue; 
+            }
+            if t2 == "#OIC" { 
+                continue; 
+            }
+            if !t2.starts_with('#') { 
+                self.out_html.push_str(&t2); 
+                self.out_html.push(' '); 
+                continue; 
+            }
+            std::process::exit(1);
+        }
+    }
+
+    fn parse_paragraph(&mut self) {
+        self.out_html.push_str("<p>");
+        self.parse_inner_paragraph();
+        let end = self.next_token();
+        if end != "#OIC" { 
+            std::process::exit(1); 
+        }
+        self.out_html.push_str("</p>\n");
+    }
+
+    fn parse_inner_paragraph(&mut self) {
+        loop {
+            let t = self.next_token();
+            if t == "#OIC" { 
+                self.set_current_token(t); 
+                break; 
+            }
+            if t == "#GIMMEH" {
+                let k = self.next_token();
+                if k == "BOLD" { 
+                    self.parse_bold(); 
+                    continue; 
+                }
+                if k == "ITALICS" { 
+                    self.parse_italics(); 
+                    continue; 
+                }
+                if k == "NEWLINE" { 
+                    self.parse_newline(); 
+                    continue; 
+                }
+                if k == "SOUNDZ" { 
+                    self.parse_audio(); 
+                    continue; 
+                }
+                if k == "VIDZ" { 
+                    self.parse_video(); 
+                    continue; 
+                }
+                std::process::exit(1);
+            }
+            if t == "#MAEK" {
+                let k = self.next_token();
+                if k == "LIST" { 
+                    self.parse_list(); 
+                    continue; 
+                }
+                std::process::exit(1);
+            }
+            if t == "#LEMME SEE" { 
+                self.parse_variable_use(); 
+                continue; 
+            }
+            if t == "EOF" { 
+                std::process::exit(1); 
+            }
+            if !t.starts_with('#') { 
+                self.out_html.push_str(&t); 
+                self.out_html.push(' '); 
+                continue; 
+            }
+            std::process::exit(1);
+        }
+    }
+
+    fn parse_inner_text(&mut self) {
+        loop {
+            let t = self.next_token();
+            if t == "#MKAY" { 
+                self.set_current_token(t); 
+                break; 
+            }
+            if t == "#LEMME SEE" { 
+                self.parse_variable_use(); 
+                continue; 
+            }
+            if t == "NEWLINE" { 
+                self.out_html.push_str("<br/>"); 
+                continue; 
+            }
+            if t == "EOF" || t.starts_with('#') { 
+                std::process::exit(1); 
+            }
+            self.out_html.push_str(&t);
+            self.out_html.push(' ');
+        }
+    }
+
+    fn parse_variable_define(&mut self) {
+        let name = self.next_token();
+        if name.starts_with('#') || name == "EOF" { 
+            std::process::exit(1); 
+        }
+        let it = self.next_token();
+        if it != "#IT IZ" { 
+            std::process::exit(1); 
+        }
+        let mut val = String::new();
+        loop {
+            let t = self.next_token();
+            if t == "#MKAY" { 
+                break; 
+            }
+            if t == "EOF" || t.starts_with('#') { 
+                std::process::exit(1); 
+            }
+            if !val.is_empty() { 
+                val.push(' '); 
+            }
+            val.push_str(&t);
+        }
+        self.vars.insert(name, val);
+    }
+
+    fn parse_variable_use(&mut self) {
+        let name = self.next_token();
+        let end = self.next_token();
+        if end != "#MKAY" { 
+            std::process::exit(1); 
+        }
+        if let Some(v) = self.vars.get(&name) { 
+            self.out_html.push_str(v); 
+            self.out_html.push(' '); 
+        } else { 
+            std::process::exit(1); 
+        }
+    }
+
+    fn parse_bold(&mut self) {
+        self.out_html.push_str("<b>");
+        self.parse_inner_text();
+        let end = self.next_token();
+        if end != "#MKAY" { 
+            std::process::exit(1); 
+        }
+        self.out_html.push_str("</b>");
+        self.out_html.push(' ');
+    }
+
+    fn parse_italics(&mut self) {
+        self.out_html.push_str("<i>");
+        self.parse_inner_text();
+        let end = self.next_token();
+        if end != "#MKAY" { 
+            std::process::exit(1); 
+        }
+        self.out_html.push_str("</i>");
+        self.out_html.push(' ');
+    }
+
+    fn parse_list(&mut self) {
+        self.out_html.push_str("<ul>");
+        loop {
+            let t = self.next_token();
+            if t == "#OIC" { 
+                break; 
+            }
+            if t == "#GIMMEH" {
+                let k = self.next_token();
+                if k == "ITEM" { 
+                    self.parse_list_items(); 
+                    continue; 
+                }
+                std::process::exit(1);
+            }
+            if t == "EOF" { 
+                std::process::exit(1); 
+            }
+            std::process::exit(1);
+        }
+        self.out_html.push_str("</ul>");
+        self.out_html.push('\n');
+    }
+
+    fn parse_list_items(&mut self) {
+        self.out_html.push_str("<li>");
+        self.parse_inner_list();
+        let end = self.next_token();
+        if end != "#MKAY" { 
+            std::process::exit(1); 
+        }
+        self.out_html.push_str("</li>");
+    }
+
+    fn parse_inner_list(&mut self) {
+        loop {
+            let t = self.next_token();
+            if t == "#MKAY" { 
+                self.set_current_token(t); 
+                break; 
+            }
+            if t == "#LEMME SEE" { 
+                self.parse_variable_use(); 
+                continue; 
+            }
+            if t == "#GIMMEH" {
+                let k = self.next_token();
+                if k == "BOLD" { 
+                    self.parse_bold(); 
+                    continue; 
+                }
+                if k == "ITALICS" { 
+                    self.parse_italics(); 
+                    continue; 
+                }
+                if k == "NEWLINE" { 
+                    self.parse_newline(); 
+                    continue; 
+                }
+                std::process::exit(1);
+            }
+            if t == "EOF" || t.starts_with('#') { 
+                std::process::exit(1); 
+            }
+            self.out_html.push_str(&t);
+            self.out_html.push(' ');
+        }
+    }
+
+    fn parse_audio(&mut self) {
+        let addr = self.next_token();
+        if addr == "EOF" || addr.starts_with('#') { 
+            std::process::exit(1); 
+        }
+        let end = self.next_token();
+        if end != "#MKAY" { 
+            std::process::exit(1); 
+        }
+        self.out_html.push_str("<audio controls><source src=\"");
+        self.out_html.push_str(&addr);
+        self.out_html.push_str("\"></audio>");
+        self.out_html.push(' ');
+    }
+
+    fn parse_video(&mut self) {
+        let addr = self.next_token();
+        if addr == "EOF" || addr.starts_with('#') { 
+            std::process::exit(1); 
+        }
+        let end = self.next_token();
+        if end != "#MKAY" { 
+            std::process::exit(1); 
+        }
+        self.out_html.push_str("<iframe src=\"");
+        self.out_html.push_str(&addr);
+        self.out_html.push_str("\"></iframe>");
+        self.out_html.push(' ');
+    }
+
+    fn parse_newline(&mut self) {
+        let end = self.next_token();
+        if end != "#MKAY" { 
+            std::process::exit(1); 
+        }
+        self.out_html.push_str("<br/>");
+        self.out_html.push('\n');
+    }
+
+    fn parse_text(&mut self) {
+        let t = self.next_token();
+        if t == "EOF" || t.starts_with('#') { 
+            std::process::exit(1); 
+        }
+        self.out_html.push_str(&t);
+        self.out_html.push(' ');
+    }
+}
+
+
+fn main() {
+
+    //we take one argument, which is a .lol file
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: lolcompiler <file.lol>");
+        process::exit(1);
+    }
+
+    //just assurance the ran code ends with a .lol extention
+    let path = &args[1];
+    if !path.ends_with(".lol") {
+        eprintln!("Error: input file must end with .lol");
+        process::exit(1);
+    }
+
+    //read the file as a string
+    let source = fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("Error reading '{}': {}", path, e);
+        process::exit(1);
+    });
+
+    //and here we run the compiler
+    let mut c = LolCompiler::new(&source);
+    c.compile(&source);
+}
